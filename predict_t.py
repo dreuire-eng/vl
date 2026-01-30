@@ -4,6 +4,7 @@ import pickle
 import sys
 from datetime import datetime, timedelta
 import os
+
 # =========================================================
 # 1. 설정 및 유틸리티
 # =========================================================
@@ -21,14 +22,14 @@ def get_standardized_name(name):
         '대한항공': ['KOREANAIR', 'JUMBOS', '대한항공', '점보스', 'KAL'],
         '현대캐피탈': ['HYUNDAICAPITAL', 'SKYWALKERS', '현대캐피탈', '스카이워커스'],
         'KB손해보험': ['KBSTARS', 'KBINSURANCE', 'LIG', 'KB손해보험', '케이비'],
-        'OK금융그룹': ['OKFINANCIAL', 'OKSAVINGS', 'OKMAN', 'OK금융', '읏맨'],
+        'OK금융그룹': ['OKFINANCIAL', 'OKSAVINGS', 'OKMAN', 'OK금융', '읏맨', 'OK'],
         '한국전력': ['KEPCO', 'VIXTORM', 'KOREAELECTRIC', '한국전력', '빅스톰'],
-        '우리카드': ['WOORICARD', 'WOORIWON', '우리카드', '위비'],
+        '우리카드': ['WOORICARD', 'WOORIWON', '우리카드', '위비', 'WON'],
         '삼성화재': ['SAMSUNG', 'BLUEFANGS', '삼성화재', '블루팡스'],
         '흥국생명': ['HEUNGKUK', 'PINKSPIDERS', '흥국생명', '핑크스파이더스'],
         '현대건설': ['HYUNDAIE&C', 'HILLSTATE', '현대건설', '힐스테이트'],
-        '정관장': ['JUNGKWANJANG', 'REDSPARKS', 'KGC', 'GINSENG', '정관장'],
-        'IBK기업은행': ['IBK', 'ALTOS', 'INDUSTRIALBANK', '기업은행'],
+        '정관장': ['JUNGKWANJANG', 'REDSPARKS', 'KGC', 'GINSENG', '정관장', '인삼공사'],
+        'IBK기업은행': ['IBK', 'ALTOS', 'INDUSTRIALBANK', '기업은행', '알토스'],
         'GS칼텍스': ['GSCALTEX', 'KIXX', 'GS칼텍스', '킥스'],
         '도로공사': ['HIPASS', 'EXPRESSWAY', '도로공사', '하이패스'],
         '페퍼저축은행': ['PEPPER', 'AIPEPPERS', '페퍼저축은행', '페퍼']
@@ -47,43 +48,31 @@ def build_current_team_stats():
         print(f"❌ {HISTORY_FILE} 파일이 없습니다. 03번을 먼저 실행하세요.")
         sys.exit()
 
-    # 컬럼 이름 강제 통일 (에러 방지용)
-    if 'set_score' in df.columns:
-        df.rename(columns={'set_score': 'score'}, inplace=True)
-    if 'team_name' in df.columns:
-        df.rename(columns={'team_name': 'tsname'}, inplace=True)
+    if 'set_score' in df.columns: df.rename(columns={'set_score': 'score'}, inplace=True)
+    if 'team_name' in df.columns: df.rename(columns={'team_name': 'tsname'}, inplace=True)
 
-    # 필수 컬럼 체크
     if 'tsname' not in df.columns or 'score' not in df.columns:
         print(f"🚨 컬럼 누락 에러! 현재 컬럼: {list(df.columns)}")
         sys.exit()
 
-    # 팀명 표준화
     df['team_std'] = df['tsname'].apply(get_standardized_name)
     df['game_date'] = pd.to_datetime(df['game_date'])
     df = df.sort_values(['game_date', 'game_num'])
 
-    # 숫자 변환
     num_cols = ['point', 'ats', 'att', 'bs', 'ss', 'err', 'rs', 'rt']
     for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
-    # 팀별 경기 집계
     team_grp = df.groupby(['game_date', 'game_num', 'team_std']).agg({
         'ats': 'sum', 'att': 'sum', 'bs': 'sum', 'ss': 'sum', 'err': 'sum', 
         'rs': 'sum', 'rt': 'sum', 'home_team': 'first', 'score': 'first'
     }).reset_index()
 
-    # 성공률 계산
     team_stats = team_grp.sort_values(['game_date', 'game_num'])
     team_stats['attack_rate'] = team_stats.apply(lambda x: x['ats']/x['att'] if x['att']>0 else 0, axis=1)
     team_stats['receive_rate'] = team_stats.apply(lambda x: x['rs']/x['rt'] if x['rt']>0 else 0, axis=1)
-    
-    # 홈 여부
     team_stats['is_home'] = team_stats.apply(lambda r: r['team_std'] == get_standardized_name(r['home_team']), axis=1)
     
-    # 승패 파싱 (ELO 계산용)
     def check_win(row):
         try:
             s = list(map(int, str(row['score']).split(':')))
@@ -94,16 +83,13 @@ def build_current_team_stats():
     
     team_stats['is_win'] = team_stats.apply(check_win, axis=1)
 
-    # 상태 추적
     current_state = {} 
     all_teams = team_stats['team_std'].unique()
     for t in all_teams:
         current_state[t] = {'elo': 1500, 'last_date': None, 'stats_history': []}
 
-    # 역사 복기
     for _, grp in team_stats.groupby(['game_date', 'game_num']):
         if len(grp) != 2: continue
-        
         h_row = grp[grp['is_home'] == True]
         a_row = grp[grp['is_home'] == False]
         if h_row.empty or a_row.empty: continue
@@ -111,11 +97,9 @@ def build_current_team_stats():
         h, a = h_row.iloc[0], a_row.iloc[0]
         th, ta = h['team_std'], a['team_std']
 
-        elo_h = current_state[th]['elo']
-        elo_a = current_state[ta]['elo']
+        elo_h, elo_a = current_state[th]['elo'], current_state[ta]['elo']
         w_h = h['is_win']
         
-        # ELO 업데이트
         exp_h = 1 / (1 + 10 ** ((elo_a - elo_h) / 400))
         k = 20
         new_elo_h = elo_h + k * (w_h - exp_h)
@@ -136,10 +120,10 @@ def build_current_team_stats():
 # 3. 예측 실행
 # =========================================================
 def predict_matchups():
-    print("🚀 KOVO 승부 예측 (AI Model V3 - 핸디캡 정밀 분석)")
+    print("🚀 KOVO 승부 예측 (AI Model V4 - Advanced Statistics)")
     print("-" * 50)
 
-    # 1. 모델 로드
+    # 1. 모델 로드 (새로운 키값 처리 추가)
     try:
         with open(MODEL_FILE, "rb") as f:
             model_pkg = pickle.load(f)
@@ -148,9 +132,14 @@ def predict_matchups():
         reg = model_pkg['regressor']
         scaler = model_pkg['scaler']
         features = model_pkg['features']
-        is_constrained = model_pkg.get('is_constrained', False)
         
-        print(f"🤖 AI 모델 로드 완료: {'논리제약 모드' if is_constrained else '일반 모드'}")
+        # [신규] 통계 모델용 추가 데이터 로드
+        is_advanced = model_pkg.get('is_advanced', False)
+        ortho_models = model_pkg.get('ortho_models', {})
+        
+        mode_msg = '통계적 심화 모델(직교화/상호작용)' if is_advanced else '일반 모델'
+        print(f"🤖 AI 모델 로드 완료: {mode_msg}")
+        
     except FileNotFoundError:
         print(f"❌ {MODEL_FILE} 파일이 없습니다. 04번을 실행하세요.")
         return
@@ -166,8 +155,6 @@ def predict_matchups():
     sch['aname'] = sch['aname'].apply(get_standardized_name)
     
     today = datetime.now().strftime("%Y-%m-%d")
-    # today = "2026-01-18" # 테스트 날짜 필요시 수정
-    
     todays_games = sch[sch['gdate'] == today]
     
     if todays_games.empty:
@@ -176,24 +163,29 @@ def predict_matchups():
 
     print(f"📅 {today} 경기 분석 시작 ({len(todays_games)}경기)\n")
 
-    for _, row in todays_games.iterrows():
+    for idx, row in todays_games.iterrows():
         h_team = row['hname']
         a_team = row['aname']
         
-        if h_team not in team_state or a_team not in team_state:
-            print(f"⚠️ {h_team} vs {a_team}: 데이터 부족")
+        # [수정] 데이터 누락 디버깅 (왜 건너뛰는지 알려줌)
+        missing = []
+        if h_team not in team_state: missing.append(f"홈[{h_team}]")
+        if a_team not in team_state: missing.append(f"원정[{a_team}]")
+        
+        if missing:
+            print(f"⚠️ {h_team} vs {a_team}: 예측 불가 (데이터 부족: {', '.join(missing)})")
             continue
             
         st_h = team_state[h_team]
         st_a = team_state[a_team]
         
-        # 피처 생성
+        # 4. 기본 피처 계산
         diff_elo = st_h['elo'] - st_a['elo']
         
+        # 휴식일 (모델엔 안 들어가도 로직상 남겨둠)
         def get_rest(last_date):
             if pd.isna(last_date): return 4
             return (pd.to_datetime(today) - last_date).days
-        
         diff_rest = min(get_rest(st_h['last_date']), 14) - min(get_rest(st_a['last_date']), 14)
 
         def get_avg_stat(history, key):
@@ -205,17 +197,40 @@ def predict_matchups():
         metrics = {'diff_att': 'attack_rate', 'diff_block': 'bs', 'diff_serve': 'ss', 
                    'diff_recv': 'receive_rate', 'diff_fault': 'err'}
         
+        # 원본 피처 딕셔너리
         input_features = {}
         input_features['diff_elo'] = diff_elo
         input_features['diff_rest'] = diff_rest
         for feat_name, key in metrics.items():
             input_features[feat_name] = get_avg_stat(st_h['stats_history'], key) - get_avg_stat(st_a['stats_history'], key)
             
-        X_input = pd.DataFrame([input_features], columns=features)
-        X_scaled = pd.DataFrame(scaler.transform(X_input), columns=features)
+        # =================================================
+        # 🎯 [신규] 고급 피처 엔지니어링 (직교화 + 상호작용)
+        # =================================================
+        df_input = pd.DataFrame([input_features])
         
-        if is_constrained:
-            X_scaled['diff_fault'] = -X_scaled['diff_fault']
+        if is_advanced:
+            # 1. 범실 반전 (작을수록 좋음 -> 클수록 좋음)
+            df_input['diff_fault_inv'] = -df_input['diff_fault']
+            
+            # 2. 직교화 (순수 스탯 추출)
+            # 학습된 회귀 모델을 사용해 ELO의 영향을 제거
+            pred_att = ortho_models['att'].predict(df_input[['diff_elo']])
+            df_input['pure_att'] = df_input['diff_att'] - pred_att
+            
+            pred_blk = ortho_models['blk'].predict(df_input[['diff_elo']])
+            df_input['pure_block'] = df_input['diff_block'] - pred_blk
+            
+            # 3. 상호작용 항
+            df_input['inter_elo_att'] = df_input['diff_elo'] * df_input['diff_att'] / 1000
+        else:
+            # 구형 모델 호환성
+            if 'diff_fault' in features: 
+                df_input['diff_fault'] = -df_input['diff_fault']
+
+        # 최종 피처 선택 (학습 때 쓴 순서 그대로)
+        X_final = df_input[features]
+        X_scaled = pd.DataFrame(scaler.transform(X_final), columns=features)
 
         # 예측 수행
         prob_home = clf.predict_proba(X_scaled)[0][1]
@@ -223,19 +238,16 @@ def predict_matchups():
         pred_diff = reg.predict(X_scaled)[0]
 
         # =================================================
-        # 🎯 승률 기반 세트 스코어 및 핸디캡 전략 수립
+        # 🎯 베팅 가이드 (53% / 60% 기준)
         # =================================================
         if prob_home > 0.5:
             winner = h_team
             p_win = prob_home
-            score_diff_sign = "+" # 홈 우세
         else:
             winner = a_team
             p_win = prob_away
-            score_diff_sign = "-" # 원정 우세
             
-        # 확률 구간별 시나리오
-        if p_win >= 0.6:
+        if p_win >= 0.60:
             est_score = "3:0 (셧아웃 유력)"
             risk_level = "낮음"
         elif p_win >= 0.53:

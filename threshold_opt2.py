@@ -1,11 +1,8 @@
 import pandas as pd
 import numpy as np
 import pickle
-import sys
 import os
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import f1_score
 
 # =========================================================
 # 1. 설정 및 데이터 로드
@@ -37,13 +34,21 @@ def get_standardized_name(name):
         if any(k in name_str for k in keys): return std
     return name_str
 
-def train_best_model():
-    print("🚀 Step 4: [Final] 모델 학습 (논리 제약 적용 Ver.)")
+def analyze_point_thresholds():
+    print("🚀 예상 득실차(Predicted Point Diff) 기반 스코어 분석")
+    print("-" * 60)
 
-    if not os.path.exists(DATA_FILE):
-        print(f"❌ 데이터 파일 없음: {DATA_FILE}")
+    # 1. 모델 로드
+    if not os.path.exists(MODEL_FILE):
+        print("❌ 모델 파일이 없습니다.")
         return
+    with open(MODEL_FILE, "rb") as f: pkg = pickle.load(f)
+    clf = pkg['classifier']
+    reg = pkg['regressor'] 
+    scaler = pkg['scaler']
+    features = pkg['features']
 
+    # 2. 데이터 준비
     df = pd.read_csv(DATA_FILE)
     if 'set_score' in df.columns: df.rename(columns={'set_score': 'score'}, inplace=True)
     if 'team_name' in df.columns: df.rename(columns={'team_name': 'tsname'}, inplace=True)
@@ -65,16 +70,9 @@ def train_best_model():
     team_grp['attack_rate'] = team_grp.apply(lambda x: x['ats']/x['att'] if x['att']>0 else 0, axis=1)
     team_grp['receive_rate'] = team_grp.apply(lambda x: x['rs']/x['rt'] if x['rt']>0 else 0, axis=1)
     team_grp['home_team_std'] = team_grp['home_team'].astype(str).apply(get_standardized_name)
+    
+    # 홈팀 여부 재확인
     team_grp['is_home'] = team_grp['team_std'] == team_grp['home_team_std']
-
-    def check_win(row):
-        try:
-            s = list(map(int, str(row['score']).split(':')))
-            if len(s)<2: return 0
-            my, opp = (s[0], s[1]) if row['is_home'] else (s[1], s[0])
-            return 1 if my > opp else 0
-        except: return 0
-    team_grp['is_win'] = team_grp.apply(check_win, axis=1)
 
     # Rolling Mean
     team_grp = team_grp.sort_values(['team_std', 'game_date'])
@@ -90,13 +88,20 @@ def train_best_model():
     for _, grp in sorted_games.groupby(['game_date', 'game_num']):
         if len(grp) != 2: continue
         
+        # [수정] 인덱스 에러 방지용 안전장치
         h_rows = grp[grp['is_home'] == True]
         a_rows = grp[grp['is_home'] == False]
-        if h_rows.empty or a_rows.empty: continue
         
+        if h_rows.empty or a_rows.empty:
+            continue # 데이터 불량이면 패스
+            
         h, a = h_rows.iloc[0], a_rows.iloc[0]
         th, ta = h['team_std'], a['team_std']
-        point_diff = h['point'] - a['point']
+        
+        try:
+            s = list(map(int, str(h['score']).split(':')))
+            real_set_diff = s[0] - s[1] 
+        except: continue
 
         matches.append({
             'diff_elo': elo[th] - elo[ta],
@@ -105,63 +110,83 @@ def train_best_model():
             'diff_serve': h['roll_ss'] - a['roll_ss'],
             'diff_recv': h['roll_receive_rate'] - a['roll_receive_rate'],
             'diff_fault': h['roll_err'] - a['roll_err'],
-            'result_win': h['is_win'],
-            'point_diff': point_diff
+            'real_set_diff': real_set_diff
         })
         
-        w_h = h['is_win']
+        w_h = 1 if real_set_diff > 0 else 0
         exp_h = 1 / (1 + 10 ** ((elo[ta] - elo[th]) / 400))
         elo[th] += 20 * (w_h - exp_h)
         elo[ta] += 20 * ((1 - w_h) - (1 - exp_h))
 
-    train_df = pd.DataFrame(matches).dropna()
-    
-    # [중요] 범실은 적을수록 좋으므로 부호 반전
-    # 반전 후 양수 가중치 = 감점 효과 (Penalty)
-    train_df['diff_fault'] = -train_df['diff_fault']
-    
-    features = ['diff_elo', 'diff_att', 'diff_block', 'diff_serve', 'diff_recv', 'diff_fault']
-    
-    X = train_df[features]
-    y = train_df['result_win']
-    y_reg = train_df['point_diff']
-    
-    scaler = StandardScaler()
-    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=features)
-    
-    # ---------------------------------------------------------
-    # 🤖 [핵심] 논리 제약 (Positive Constraint) 적용
-    # ---------------------------------------------------------
-    print("🔍 모델 학습 중... (Positive=True 적용)")
-    print("   👉 ELO, 공격, 블로킹, 서브 등 모든 지표가 '양수 효과'를 내도록 강제합니다.")
-    print("   👉 범실은 입력값을 뒤집었으므로, 가중치가 양수면 '감점'이 됩니다.")
+    # 분석 시작
+    if not matches:
+        print("❌ 분석할 경기 데이터가 없습니다.")
+        return
 
-    param_grid = {'alpha': [0.1, 1.0, 5.0, 10.0, 20.0, 50.0]}
+    df_m = pd.DataFrame(matches).dropna()
+    df_m['diff_fault'] = -df_m['diff_fault']
     
-    # positive=True: 계수를 무조건 0 이상으로 만듦
-    # 이렇게 하면 엉뚱하게 '공격 잘하면 손해' 같은 결과가 절대 안 나옴.
-    estimator = Ridge(positive=True)
+    X = df_m[features]
+    X_scaled = pd.DataFrame(scaler.transform(X), columns=features)
     
-    grid_reg = GridSearchCV(estimator, param_grid, cv=5, scoring='neg_mean_squared_error')
-    grid_reg.fit(X_scaled, y_reg)
+    # 예상 점수차 계산
+    df_m['pred_point_diff'] = reg.predict(X_scaled)
     
-    best_reg = grid_reg.best_estimator_
-    print(f"   👉 최적 Alpha: {best_reg.alpha}")
+    # 홈팀 승리 예상 경기만 필터링 (점수차 > 0)
+    home_wins = df_m[df_m['pred_point_diff'] > 0].copy()
     
-    clf = LogisticRegression(C=1.0, random_state=42)
-    clf.fit(X_scaled, y)
+    print("\n📊 1. 예상 득실차 구간별 실제 결과 (Grid Search)")
+    print(f"{'Pred Points':<15} | {'Games':<5} | {'3:0(%)':<8} | {'3:1(%)':<8} | {'3:2(%)':<8} | {'Fail(%)'}")
+    print("-" * 75)
+    
+    bins = [0, 5, 10, 15, 20, 100]
+    labels = ["0~5pts", "5~10pts", "10~15pts", "15~20pts", "20pts+"]
+    
+    home_wins['bin'] = pd.cut(home_wins['pred_point_diff'], bins=bins, labels=labels)
+    
+    for label in labels:
+        subset = home_wins[home_wins['bin'] == label]
+        total = len(subset)
+        if total == 0: continue
+        
+        cnt_30 = len(subset[subset['real_set_diff'] == 3])
+        cnt_31 = len(subset[subset['real_set_diff'] == 2])
+        cnt_32 = len(subset[subset['real_set_diff'] == 1])
+        cnt_fail = len(subset[subset['real_set_diff'] < 0])
+        
+        print(f"{label:<15} | {total:<5} | {cnt_30/total*100:>6.1f}%  | {cnt_31/total*100:>6.1f}%  | {cnt_32/total*100:>6.1f}%  | {cnt_fail/total*100:>6.1f}%")
 
-    save_pkg = {
-        'classifier': clf,
-        'regressor': best_reg,
-        'scaler': scaler,
-        'features': features,
-        'is_advanced': False
-    }
+    print("\n\n🎯 2. 최적 점수 기준 탐색")
     
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(save_pkg, f)
-    print(f"💾 모델 재학습 완료: {MODEL_FILE}")
+    # (1) 3:0 셧아웃 (마핸 -2.5 가능 구간)
+    y_true_30 = (home_wins['real_set_diff'] == 3).astype(int)
+    best_th_30 = 0
+    best_f1_30 = 0
+    
+    for th in range(5, 25): 
+        y_pred = (home_wins['pred_point_diff'] >= th).astype(int)
+        score = f1_score(y_true_30, y_pred, zero_division=0)
+        if score > best_f1_30:
+            best_f1_30 = score
+            best_th_30 = th
+            
+    print(f"   🏆 [3:0 셧아웃] 최적 기준: +{best_th_30}점 이상")
+    print(f"      (이 점수 이상일 때 -2.5 마핸 성공률 급상승)")
+
+    # (2) 3:2 접전 (플핸 +1.5 필수 구간)
+    y_true_32 = (home_wins['real_set_diff'] == 1).astype(int)
+    best_th_32 = 0
+    best_f1_32 = 0
+    
+    for th in range(1, 15):
+        y_pred = (home_wins['pred_point_diff'] <= th).astype(int)
+        score = f1_score(y_true_32, y_pred, zero_division=0)
+        if score > best_f1_32:
+            best_f1_32 = score
+            best_th_32 = th
+            
+    print(f"   🏆 [3:2 풀세트] 최적 기준: +{best_th_32}점 미만")
+    print(f"      (이 점수 미만일 때 마핸 절대 금지)")
 
 if __name__ == "__main__":
-    train_best_model()
+    analyze_point_thresholds()

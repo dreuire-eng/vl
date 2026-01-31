@@ -1,11 +1,8 @@
 import pandas as pd
 import numpy as np
 import pickle
-import sys
 import os
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import f1_score
 
 # =========================================================
 # 1. 설정 및 데이터 로드
@@ -13,6 +10,10 @@ from sklearn.model_selection import GridSearchCV
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "kovo_analysis_ready.csv")
 MODEL_FILE = os.path.join(BASE_DIR, "kovo_dual_model.pkl")
+
+# 남녀 팀 구분 리스트
+MEN_TEAMS = ['대한항공', '현대캐피탈', 'KB손해보험', 'OK금융그룹', '한국전력', '우리카드', '삼성화재']
+WOMEN_TEAMS = ['흥국생명', '현대건설', '정관장', 'IBK기업은행', 'GS칼텍스', '도로공사', '페퍼저축은행']
 
 def get_standardized_name(name):
     if pd.isna(name): return ""
@@ -37,13 +38,25 @@ def get_standardized_name(name):
         if any(k in name_str for k in keys): return std
     return name_str
 
-def train_best_model():
-    print("🚀 Step 4: [Final] 모델 학습 (논리 제약 적용 Ver.)")
+def get_gender(team_name):
+    """ 팀 이름으로 성별 구분 """
+    if team_name in MEN_TEAMS: return 'Male'
+    if team_name in WOMEN_TEAMS: return 'Female'
+    return 'Unknown'
 
-    if not os.path.exists(DATA_FILE):
-        print(f"❌ 데이터 파일 없음: {DATA_FILE}")
+def analyze_by_gender():
+    print("🚀 [남녀 구분] 예상 득실차 기반 스코어 분석")
+    print("-" * 60)
+
+    if not os.path.exists(MODEL_FILE):
+        print("❌ 모델 파일이 없습니다.")
         return
+    with open(MODEL_FILE, "rb") as f: pkg = pickle.load(f)
+    reg = pkg['regressor'] 
+    scaler = pkg['scaler']
+    features = pkg['features']
 
+    # 데이터 준비
     df = pd.read_csv(DATA_FILE)
     if 'set_score' in df.columns: df.rename(columns={'set_score': 'score'}, inplace=True)
     if 'team_name' in df.columns: df.rename(columns={'team_name': 'tsname'}, inplace=True)
@@ -67,15 +80,6 @@ def train_best_model():
     team_grp['home_team_std'] = team_grp['home_team'].astype(str).apply(get_standardized_name)
     team_grp['is_home'] = team_grp['team_std'] == team_grp['home_team_std']
 
-    def check_win(row):
-        try:
-            s = list(map(int, str(row['score']).split(':')))
-            if len(s)<2: return 0
-            my, opp = (s[0], s[1]) if row['is_home'] else (s[1], s[0])
-            return 1 if my > opp else 0
-        except: return 0
-    team_grp['is_win'] = team_grp.apply(check_win, axis=1)
-
     # Rolling Mean
     team_grp = team_grp.sort_values(['team_std', 'game_date'])
     metrics = ['attack_rate', 'bs', 'ss', 'err', 'receive_rate']
@@ -93,75 +97,68 @@ def train_best_model():
         h_rows = grp[grp['is_home'] == True]
         a_rows = grp[grp['is_home'] == False]
         if h_rows.empty or a_rows.empty: continue
-        
+            
         h, a = h_rows.iloc[0], a_rows.iloc[0]
         th, ta = h['team_std'], a['team_std']
-        point_diff = h['point'] - a['point']
+        
+        try:
+            s = list(map(int, str(h['score']).split(':')))
+            real_set_diff = s[0] - s[1] 
+        except: continue
 
         matches.append({
+            'gender': get_gender(th), # 성별 태깅
             'diff_elo': elo[th] - elo[ta],
             'diff_att': h['roll_attack_rate'] - a['roll_attack_rate'],
             'diff_block': h['roll_bs'] - a['roll_bs'],
             'diff_serve': h['roll_ss'] - a['roll_ss'],
             'diff_recv': h['roll_receive_rate'] - a['roll_receive_rate'],
             'diff_fault': h['roll_err'] - a['roll_err'],
-            'result_win': h['is_win'],
-            'point_diff': point_diff
+            'real_set_diff': real_set_diff
         })
         
-        w_h = h['is_win']
+        w_h = 1 if real_set_diff > 0 else 0
         exp_h = 1 / (1 + 10 ** ((elo[ta] - elo[th]) / 400))
         elo[th] += 20 * (w_h - exp_h)
         elo[ta] += 20 * ((1 - w_h) - (1 - exp_h))
 
-    train_df = pd.DataFrame(matches).dropna()
-    
-    # [중요] 범실은 적을수록 좋으므로 부호 반전
-    # 반전 후 양수 가중치 = 감점 효과 (Penalty)
-    train_df['diff_fault'] = -train_df['diff_fault']
-    
-    features = ['diff_elo', 'diff_att', 'diff_block', 'diff_serve', 'diff_recv', 'diff_fault']
-    
-    X = train_df[features]
-    y = train_df['result_win']
-    y_reg = train_df['point_diff']
-    
-    scaler = StandardScaler()
-    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=features)
-    
-    # ---------------------------------------------------------
-    # 🤖 [핵심] 논리 제약 (Positive Constraint) 적용
-    # ---------------------------------------------------------
-    print("🔍 모델 학습 중... (Positive=True 적용)")
-    print("   👉 ELO, 공격, 블로킹, 서브 등 모든 지표가 '양수 효과'를 내도록 강제합니다.")
-    print("   👉 범실은 입력값을 뒤집었으므로, 가중치가 양수면 '감점'이 됩니다.")
+    if not matches: return
 
-    param_grid = {'alpha': [0.1, 1.0, 5.0, 10.0, 20.0, 50.0]}
+    df_m = pd.DataFrame(matches).dropna()
+    df_m['diff_fault'] = -df_m['diff_fault']
     
-    # positive=True: 계수를 무조건 0 이상으로 만듦
-    # 이렇게 하면 엉뚱하게 '공격 잘하면 손해' 같은 결과가 절대 안 나옴.
-    estimator = Ridge(positive=True)
+    X = df_m[features]
+    X_scaled = pd.DataFrame(scaler.transform(X), columns=features)
+    df_m['pred_point_diff'] = reg.predict(X_scaled)
     
-    grid_reg = GridSearchCV(estimator, param_grid, cv=5, scoring='neg_mean_squared_error')
-    grid_reg.fit(X_scaled, y_reg)
+    # 홈팀 승리 예상 경기만 필터링
+    home_wins = df_m[df_m['pred_point_diff'] > 0].copy()
     
-    best_reg = grid_reg.best_estimator_
-    print(f"   👉 최적 Alpha: {best_reg.alpha}")
-    
-    clf = LogisticRegression(C=1.0, random_state=42)
-    clf.fit(X_scaled, y)
+    bins = [0, 5, 10, 15, 100]
+    labels = ["0~5pts", "5~10pts", "10~15pts", "15pts+"]
+    home_wins['bin'] = pd.cut(home_wins['pred_point_diff'], bins=bins, labels=labels)
 
-    save_pkg = {
-        'classifier': clf,
-        'regressor': best_reg,
-        'scaler': scaler,
-        'features': features,
-        'is_advanced': False
-    }
-    
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump(save_pkg, f)
-    print(f"💾 모델 재학습 완료: {MODEL_FILE}")
+    # =========================================================
+    # 📊 남녀 분리 출력
+    # =========================================================
+    for gender in ['Male', 'Female']:
+        print(f"\n🏐 [{gender}] 리그 분석 결과")
+        print(f"{'Pred Points':<15} | {'Games':<5} | {'3:0(%)':<8} | {'3:1(%)':<8} | {'3:2(%)':<8} | {'Fail(%)'}")
+        print("-" * 75)
+        
+        subset_g = home_wins[home_wins['gender'] == gender]
+        
+        for label in labels:
+            subset = subset_g[subset_g['bin'] == label]
+            total = len(subset)
+            if total == 0: continue
+            
+            cnt_30 = len(subset[subset['real_set_diff'] == 3])
+            cnt_31 = len(subset[subset['real_set_diff'] == 2])
+            cnt_32 = len(subset[subset['real_set_diff'] == 1])
+            cnt_fail = len(subset[subset['real_set_diff'] < 0])
+            
+            print(f"{label:<15} | {total:<5} | {cnt_30/total*100:>6.1f}%  | {cnt_31/total*100:>6.1f}%  | {cnt_32/total*100:>6.1f}%  | {cnt_fail/total*100:>6.1f}%")
 
 if __name__ == "__main__":
-    train_best_model()
+    analyze_by_gender()

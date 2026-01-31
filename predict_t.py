@@ -5,6 +5,15 @@ import sys
 import os
 from datetime import datetime
 
+# [추가] 성별 구분 리스트
+MEN_TEAMS = ['대한항공', '현대캐피탈', 'KB손해보험', 'OK금융그룹', '한국전력', '우리카드', '삼성화재']
+WOMEN_TEAMS = ['흥국생명', '현대건설', '정관장', 'IBK기업은행', 'GS칼텍스', '도로공사', '페퍼저축은행']
+
+def get_gender(team_name):
+    if team_name in MEN_TEAMS: return 'Male'
+    if team_name in WOMEN_TEAMS: return 'Female'
+    return 'Unknown'
+
 # =========================================================
 # 1. 설정 및 유틸리티
 # =========================================================
@@ -114,11 +123,11 @@ def build_current_team_stats():
     return current_state
 
 # =========================================================
-# 3. 예측 실행
+# 3. 예측 실행 (남녀 구분 로직 적용 Ver.)
 # =========================================================
 def predict_matchups():
-    print("🚀 KOVO 승부 예측 (Final Simple Model)")
-    print("-" * 50)
+    print("🚀 KOVO 승부 예측 (Gender-Specific Logic)")
+    print("-" * 60)
 
     try:
         with open(MODEL_FILE, "rb") as f: model_pkg = pickle.load(f)
@@ -126,9 +135,9 @@ def predict_matchups():
         reg = model_pkg['regressor']
         scaler = model_pkg['scaler']
         features = model_pkg['features']
-        print(f"🤖 모델 로드 완료: 기본 Rolling 모델")
+        print(f"🤖 모델 로드 완료: Point Diff + Gender Split")
     except FileNotFoundError:
-        print(f"❌ {MODEL_FILE} 파일이 없습니다. 04번을 먼저 실행하세요.")
+        print(f"❌ {MODEL_FILE} 파일이 없습니다.")
         return
 
     print("🔄 팀 전력 데이터 구축 중...")
@@ -152,21 +161,16 @@ def predict_matchups():
         h_team = row['hname']
         a_team = row['aname']
         
-        missing = []
-        if h_team not in team_state: missing.append(f"홈[{h_team}]")
-        if a_team not in team_state: missing.append(f"원정[{a_team}]")
-        
-        if missing:
-            print(f"⚠️ {h_team} vs {a_team}: 예측 불가")
-            print(f"   👉 원인: {', '.join(missing)} 팀의 과거 데이터가 없습니다.")
-            print(f"   👉 팁: 03번 파일을 열어서 해당 팀 이름이 이상한지 확인해보세요.")
-            print(f"   👉 현재 인식된 팀들: {list(team_state.keys())}")
+        if h_team not in team_state:
+            print(f"⚠️ {h_team} vs {a_team}: 데이터 부족")
             continue
             
         st_h = team_state[h_team]
         st_a = team_state[a_team]
         
-        # 피처 계산 (Rolling Mean)
+        # 성별 확인
+        gender = get_gender(h_team)
+        
         diff_elo = st_h['elo'] - st_a['elo']
         
         def get_avg(hist, key):
@@ -183,35 +187,96 @@ def predict_matchups():
             input_data[feat] = get_avg(st_h['stats_history'], key) - get_avg(st_a['stats_history'], key)
             
         df_input = pd.DataFrame([input_data])
-        
-        # 범실 반전
-        if 'diff_fault' in features: 
-            df_input['diff_fault'] = -df_input['diff_fault']
+        if 'diff_fault' in features: df_input['diff_fault'] = -df_input['diff_fault']
 
-        # 예측
-        try:
-            X_scaled = pd.DataFrame(scaler.transform(df_input[features]), columns=features)
-        except Exception as e:
-            print(f"❌ 피처 에러: {e}")
-            continue
-            
+        X_scaled = pd.DataFrame(scaler.transform(df_input[features]), columns=features)
+        
         prob_home = clf.predict_proba(X_scaled)[0][1]
-        pred_diff = reg.predict(X_scaled)[0]
+        pred_diff = reg.predict(X_scaled)[0] # 예상 득실차
         
         if prob_home > 0.5:
-            winner, p_win = h_team, prob_home
+            winner, p_win, loser = h_team, prob_home, a_team
         else:
-            winner, p_win = a_team, 1 - prob_home
+            winner, p_win, loser = a_team, 1 - prob_home, h_team
             
-        if p_win >= 0.64: est_score = "3:0 (셧아웃)"
-        elif p_win >= 0.56: est_score = "3:1 (우세)"
-        else: est_score = "3:2 (접전)"
+        abs_diff = abs(pred_diff)
 
-        print(f"🏐 {h_team} (Home) vs {a_team} (Away)")
+        # =========================================================
+        # 🎯 [Final Ver.] 승률 & 득실차 교차 검증 (남녀 차등 + 3:2 리스크 반영)
+        # =========================================================
+        est_score = ""
+        risk = ""
+        guide_msg = []
+
+        # ---------------------------------------------------------
+        # ♂️ 남자부: 강팀도 5세트 가면 죽는다 (데이터 증명 완료)
+        # ---------------------------------------------------------
+        if gender == 'Male':
+            # 1. [승률 필터] 65% 미만은 믿지 마라 (기존 동일)
+            if p_win < 0.65:
+                est_score = "3:2 (AI 승률 신뢰도 낮음)"
+                risk = "매우 높음"
+                guide_msg.append(f"👉 승패 : 🚫 패스 권장 (50:50 동전던지기)")
+                guide_msg.append(f"👉 핸디캡 : 🍯 {loser} +1.5 플핸 (역배 45% 터짐)")
+                
+            # 2. [승률 통과] 65% 이상이지만... 점수차를 봐야 한다
+            else:
+                if abs_diff >= 10.0: # 완벽한 구간
+                    est_score = "3:0 (셧아웃 유력)"
+                    risk = "낮음"
+                    guide_msg.append(f"👉 {winner} -1.5 마핸 : 💎 강력 추천")
+                    
+                elif abs_diff >= 7.0: # 일반적인 승리
+                    est_score = "3:1 (우세)"
+                    risk = "중간"
+                    guide_msg.append(f"👉 {winner} 일반승 : ✅ 추천")
+                    guide_msg.append(f"👉 {winner} -1.5 마핸 : ⚠️ 소액 접근")
+                    
+                else: # [핵심 수정] 승률은 높은데 점수차 7점 미만 (3:2 예상)
+                    # 데이터: 정배 승률 52.8% vs 역배 47.2% -> 베팅 가치 없음
+                    est_score = "3:2 (강팀의 고전 예상)"
+                    risk = "높음" 
+                    guide_msg.append(f"👉 승패 : 🚫 절대 패스 (이 구간 승률 52% 불과)")
+                    guide_msg.append(f"👉 핸디캡 : 🔥 {loser} +1.5 플핸 (무조건 먹는 꿀통)")
+                    guide_msg.append(f"👉 언더/오버 : 🟢 오버 (풀세트 혈전)")
+
+        # ---------------------------------------------------------
+        # ♀️ 여자부: 물 들어올 때 노 저어라 (기존 동일)
+        # ---------------------------------------------------------
+        else:
+            if abs_diff >= 10.0: 
+                est_score = "3:0 (강력한 셧아웃)"
+                risk = "매우 낮음"
+                guide_msg.append(f"👉 {winner} -1.5 마핸 : 💎 전재산(?).. 강력 추천")
+                guide_msg.append(f"👉 {winner} -2.5 마핸 : ✅ 추천")
+                
+            elif abs_diff >= 5.0: 
+                est_score = "3:0 or 3:1 (완승)"
+                risk = "낮음"
+                guide_msg.append(f"👉 {winner} -1.5 마핸 : ✅ 추천 (안전)")
+                guide_msg.append(f"👉 {winner} 일반승 : 💎 보너스 배당")
+                
+            else: 
+                est_score = "3:2 (접전승)"
+                risk = "중간"
+                guide_msg.append(f"👉 {winner} 일반승 : ✅ 추천 (여자부는 강팀이 결국 이김)")
+                guide_msg.append(f"👉 핸디캡 : {loser} +1.5 플핸 (보험용)")
+
+        # [최종 출력]
+        gender_icon = "‍♂️" if gender == 'Male' else "‍♀️"
+        print(f"🏐 [{gender_icon}] {h_team} (Home) vs {a_team} (Away)")
         print(f"   📊 전력: ELO {st_h['elo']:.0f} vs {st_a['elo']:.0f} (ELO차이 {diff_elo:+.0f})")
-        print(f"   🏆 예측 승자: {'🏠' if prob_home>0.5 else '✈️'} {winner} ({p_win*100:.1f}%)")
-        print(f"   🔢 예상 스코어: {est_score} / 득실마진 {pred_diff:+.1f}")
-        print("-" * 50)
+        
+        icon = "🏠" if prob_home > 0.5 else "✈️"
+        print(f"   🏆 예측 승자: {icon} {winner} (확률 {p_win*100:.1f}%)")
+        print(f"   🔢 예상 스코어: {est_score}")
+        print(f"   📉 예상 득실차: {pred_diff:+.1f}점")
+        
+        print("\n   💡 [베팅 가이드]")
+        for msg in guide_msg:
+            print(f"      {msg}")
+
+        print("-" * 60)
 
 if __name__ == "__main__":
     predict_matchups()

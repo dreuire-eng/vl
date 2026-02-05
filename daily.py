@@ -8,7 +8,7 @@ import os
 # (파일이 같은 폴더에 있어야 합니다)
 try:
     import schedule as step1
-    import collect_plus as step2
+    import collect as step2
     import process as step3
     import train as step4
     import predict_t as step5

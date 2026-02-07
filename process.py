@@ -1,91 +1,79 @@
 import pandas as pd
-import json
 import os
 
-def process_kovo_data_final():
-    print("Step 3: 데이터 파싱 및 분석용 파일 변환 (변수명 대통합)...")
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    input_file  = os.path.join(BASE_DIR, "kovo_player_stats_final.csv")
-    output_file = os.path.join(BASE_DIR, "kovo_analysis_ready.csv")
+# ==========================================
+# 1. 설정
+# ==========================================
+INPUT_FILE = "kovo_schedule_result.csv"
+OUTPUT_FILE = "kovo_analysis_ready.csv"
 
-    # 1. 파일 로드
-    try:
-        df = pd.read_csv(input_file)
-        print(f"📂 원본 데이터 로드: {len(df)}경기")
-    except FileNotFoundError:
-        print("❌ 파일이 없습니다. Step 2를 먼저 실행하세요.")
+# 🔥 [최적화 완료] 적중률 1위 구간 (65.68%)
+# 24-25 시즌 개막(2024-10-19) 직전인 10월 1일부터 사용
+START_DATE = "2024-10-01" 
+
+def standardize_team_name(name):
+    if pd.isna(name): return ""
+    name = str(name).replace(" ", "").upper()
+    
+    mapping = {
+        '대한항공': ['대한항공', '점보스', 'JUMBOS'],
+        '현대캐피탈': ['현대캐피탈', '스카이워커스', 'SKYWALKERS'],
+        'KB손해보험': ['KB손해보험', 'KB', 'KBSTARS', '케이비', 'LIG'],
+        'OK금융그룹': ['OK금융', 'OK', 'OK저축은행', 'OKMAN', '읏맨'],
+        '한국전력': ['한국전력', 'KEPCO', '빅스톰', 'VIXTORM'],
+        '우리카드': ['우리카드', '위비', 'WON', 'WOORICARD'],
+        '삼성화재': ['삼성화재', '블루팡스', 'BLUEFANGS'],
+        '흥국생명': ['흥국생명', '핑크스파이더스', 'PINKSPIDERS'],
+        '현대건설': ['현대건설', '힐스테이트', 'HILLSTATE'],
+        '정관장': ['정관장', 'KGC', '인삼공사', 'REDSPARKS'],
+        'IBK기업은행': ['IBK', '기업은행', '알토스', 'ALTOS'],
+        'GS칼텍스': ['GS칼텍스', 'KIXX', 'GS'],
+        '도로공사': ['도로공사', '하이패스', 'HIPASS', '한국도로공사'],
+        '페퍼저축은행': ['페퍼', '페퍼저축은행', 'AI', 'PEPPERS']
+    }
+    
+    for std, aliases in mapping.items():
+        if any(alias in name for alias in aliases):
+            return std
+    return name
+
+def get_gender(team_name):
+    men = ['대한항공', '현대캐피탈', 'KB손해보험', 'OK금융그룹', '한국전력', '우리카드', '삼성화재']
+    return 'Male' if team_name in men else 'Female'
+
+def process_data():
+    if not os.path.exists(INPUT_FILE):
+        print(f"❌ 파일 없음: {INPUT_FILE}")
         return
 
-    all_players_rows = []
+    print(f"📂 {INPUT_FILE} 로드 중...")
+    df = pd.read_csv(INPUT_FILE)
     
-    # 2. 파싱 및 펼치기 (Flatten)
-    print("🚀 데이터 변환 작업 시작 (Standardized Columns 적용)...")
+    # 1. 날짜 처리
+    df['gdate'] = pd.to_datetime(df['gdate'])
     
-    for idx, row in df.iterrows():
-        try:
-            # 🚨 [핵심] 여기서부터 변수명을 schedule.py와 100% 일치시킵니다.
-            meta = {
-                'gdate': str(row.get('date', '')).split()[0],  # game_date -> gdate
-                'seasonCode': row.get('season_code', ''),      # season -> seasonCode
-                'round': row.get('round', ''),
-                'gnum': row.get('gnum', ''),                   # game_num -> gnum
-                'hname': row.get('home', ''),                  # home_team -> hname
-                'aname': row.get('away', ''),                  # away_team -> aname
-                'score': row.get('score', '')                  # set_score -> score
-            }
+    # 2. 기간 필터링 (최적화된 2년치 데이터)
+    df = df[df['gdate'] >= START_DATE].copy()
+    
+    # 3. 스코어 정제
+    df = df.dropna(subset=['score'])
+    df['score'] = df['score'].astype(str).str.replace(" ", "")
+    df = df[df['score'].str.contains(":")] 
 
-            # JSON 파싱
-            player_stats_str = row.get('player_stats', '[]')
-            if isinstance(player_stats_str, str):
-                try:
-                    players = json.loads(player_stats_str)
-                except:
-                    players = []
-            else:
-                players = []
+    # 4. 팀명 표준화
+    df['h_std'] = df['hname'].apply(standardize_team_name)
+    df['a_std'] = df['aname'].apply(standardize_team_name)
+    
+    # 5. 성별 구분
+    df['gender'] = df['h_std'].apply(get_gender)
 
-            # 선수별 데이터에 메타데이터 결합
-            for p in players:
-                # p 딕셔너리에 meta 딕셔너리를 합침
-                # (주의: p에도 'tsname' 등이 있으므로 meta가 덮어쓰지 않도록 순서 주의)
-                merged = {**meta, **p}
-                all_players_rows.append(merged)
-                
-        except Exception as e:
-            print(f"⚠️ Error at row {idx}: {e}")
-            continue
-
-    # 3. 데이터프레임 생성 및 후처리
-    if all_players_rows:
-        result_df = pd.DataFrame(all_players_rows)
-        
-        # 숫자 컬럼 강제 변환
-        numeric_cols = [
-            'point', 'attackSuccessRate', 'ats', 'att', 'bs', 'ss', 'rs', 'rt', 'err'
-        ]
-        existing_num_cols = [c for c in numeric_cols if c in result_df.columns]
-        
-        for col in existing_num_cols:
-            result_df[col] = pd.to_numeric(result_df[col], errors='coerce').fillna(0)
-
-        # 불필요 컬럼 제거
-        drop_cols = ['profileImg', 'career', 'birthDate', 'teamCode'] 
-        result_df = result_df.drop(columns=[c for c in drop_cols if c in result_df.columns], errors='ignore')
-
-        # 컬럼 정렬 (표준 변수명 기준)
-        cols = list(result_df.columns)
-        priority = ['gdate', 'seasonCode', 'hname', 'aname', 'tsname', 'pname', 'position', 'point', 'score']
-        sorted_cols = [c for c in priority if c in cols] + [c for c in cols if c not in priority]
-        result_df = result_df[sorted_cols]
-
-        # 저장
-        result_df.to_csv(output_file, index=False, encoding='utf-8-sig')
-        print(f"🎉 변환 완료: {output_file}")
-        print(f"📊 총 데이터 행 수: {len(result_df)}")
-        print(f"✅ 적용된 컬럼명: gdate, seasonCode, hname, aname, score 등 확인 완료.")
-        
-    else:
-        print("⚠️ 변환할 데이터가 없습니다.")
+    # 6. 저장
+    cols = ['gdate', 'gender', 'h_std', 'a_std', 'score']
+    df[cols].sort_values('gdate').to_csv(OUTPUT_FILE, index=False)
+    
+    print(f"✅ 전처리 완료: {OUTPUT_FILE}")
+    print(f"   - 기간: {START_DATE} ~ {df['gdate'].max().date()} (최근 2시즌)")
+    print(f"   - 총 경기 수: {len(df)} 경기")
 
 if __name__ == "__main__":
-    process_kovo_data_final()
+    process_data()

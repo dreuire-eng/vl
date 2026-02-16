@@ -79,7 +79,7 @@ def predict():
     
     today = datetime.now().strftime("%Y-%m-%d")
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-    matches = get_matches([today, tomorrow])
+    matches = get_matches([today])
     
     print("\n" + "="*80)
     print(f"{'Date':^10} | {'Home':^10} vs {'Away':^10} | {'Diff':^8} | {'Pick':^10} | {'Grade':^10}")
@@ -111,7 +111,7 @@ def predict():
             # 여자: 80(Gold) -> 180(Diamond)
             if diff >= 180:
                 grade = "💎 Diamond"
-            elif diff >= 80:
+            elif diff >= 120:
                 grade = "🥇 GOLD"
             else:
                 grade = "🥈 SILVER"
